@@ -145,8 +145,89 @@ async function markPaymentDone(from,to){const d=await values("'COMPLETED'!A:Y");
 async function updateAlreadyEnrolled(){return true;}
 
 const handlers={saveLinkToELData,savePSSR,submitEL,markCompleted,searchByIndos,checkIndos,addCourseToExisting,getStaffPhone,getOutsourcePhone,markCertificateIssued,sendCertificateWithAttachment,getCompletedForCertificate,getCompletedForUI,getCompletedPage,getContactByRow,sendPhotoToFollowedBy,getOutsourceTimeByDate,getPayrollData,generatePayrollPDF,processPaymentDone,markPaymentDone,updateAlreadyEnrolled};
-app.post('/api/call',async(req,res)=>{try{const {fn,args=[]}=req.body||{};if(!handlers[fn])return res.status(404).json({ok:false,error:`Unknown function: ${fn}`});const result=await handlers[fn](...(Array.isArray(args)?args:[]));res.json({ok:true,result});}catch(e){console.error(e);res.status(500).json({ok:false,error:e.message||String(e)});}});
-app.get('/health',(req,res)=>res.status(200).json({ok:true,service:'MM-EL',time:new Date().toISOString()}));
-app.use(express.static(path.join(__dirname,'public')));
-app.get('*',(req,res)=>res.sendFile(path.join(__dirname,'public','index.html')));
-app.listen(PORT,'0.0.0.0',()=>console.log(`MM-EL Railway server listening on ${PORT}`));
+app.post('/api/el/call',async(req,res)=>{try{const {fn,args=[]}=req.body||{};if(!handlers[fn])return res.status(404).json({ok:false,error:`Unknown function: ${fn}`});const result=await handlers[fn](...(Array.isArray(args)?args:[]));res.json({ok:true,result});}catch(e){console.error(e);res.status(500).json({ok:false,error:e.message||String(e)});}});
+
+// ===================== MM-OUTSOURCE BACKEND =====================
+const OUT_ENROLL_CONTACTS = {
+  NOBLE: '7550191470', SANKARI: '7550191470', SAROMIAH: '7550191470', SEKAR: '7550191470'
+};
+function outHeaderKey(v){ return norm(v).toLowerCase().replace(/[^a-z0-9]/g,''); }
+function outNormalize(v){ return norm(v).toUpperCase().replace(/[^A-Z0-9]/g,''); }
+function outInputDate(v){ const m=String(v||'').match(/^(\d{4})-(\d{2})-(\d{2})$/); if(!m) throw new Error('Invalid date'); return new Date(+m[1],+m[2]-1,+m[3]); }
+function toA1Column(n){ let s=''; while(n>0){ n--; s=String.fromCharCode(65+(n%26))+s; n=Math.floor(n/26);} return s; }
+
+async function outValidateStaff(username,passkey){
+  const d=await values("'CONTACTS'!A:D"); username=norm(username).toLowerCase(); passkey=norm(passkey);
+  for(let i=1;i<d.length;i++) if(norm(d[i][2]).toLowerCase()===username && norm(d[i][3])===passkey) return norm(d[i][0]);
+  return '';
+}
+async function outGetTimeChartData(passkey,fromDate,toDate){
+  if(!fromDate||!toDate) throw new Error('Please select From and To date');
+  const [contacts,courses,completed]=await Promise.all([values("'CONTACTS'!A:D"),values("'COURSES'!A:B"),values("'COMPLETED'!A:V")]);
+  let staff=''; for(let i=1;i<contacts.length;i++) if(norm(contacts[i][3])===norm(passkey)){staff=norm(contacts[i][0]);break;}
+  if(!staff) throw new Error('Invalid Passkey');
+  const hours={}; for(let i=1;i<courses.length;i++) hours[outNormalize(courses[i][0])]=Number(courses[i][1])||0;
+  const a=outInputDate(fromDate); a.setHours(0,0,0,0); const b=outInputDate(toDate); b.setHours(23,59,59,999);
+  const out=[]; for(let i=1;i<completed.length;i++){ if(norm(completed[i][11])!==staff) continue; const dt=parseDateCell(completed[i][21]); if(!dt||dt<a||dt>b) continue; const c=norm(completed[i][14]); out.push([completed[i][0]||'',c,hours[outNormalize(c)]||0,new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Kolkata',day:'2-digit',month:'2-digit',year:'numeric'}).format(dt).replaceAll('/','-')]); }
+  return out;
+}
+async function outGetCoursesByIndos(indos){
+  indos=norm(indos).toUpperCase(); if(!indos) return [];
+  for(const sh of ['EL DATA','New EL DATA']){ const d=await values(`'${sh}'!A:Z`); if(d.length<2) continue; const h=d[0].map(outHeaderKey), ic=h.indexOf('indosno'), cc=h.indexOf('courses'); if(ic<0||cc<0) continue; for(let i=1;i<d.length;i++) if(norm(d[i][ic]).toUpperCase()===indos) return norm(d[i][cc]).split(',').map(x=>x.trim()).filter(Boolean); }
+  return [];
+}
+async function outLocateIndos(indos){
+  indos=norm(indos).toUpperCase();
+  for(const sh of ['EL DATA','New EL DATA']){ const d=await values(`'${sh}'!A:Z`); if(d.length<2) continue; const h=d[0].map(outHeaderKey), ic=h.indexOf('indosno'), cc=h.indexOf('courses'), sc=h.indexOf('status'); if(ic<0||cc<0) continue; for(let i=1;i<d.length;i++) if(norm(d[i][ic]).toUpperCase()===indos) return {sheetName:sh,data:d,headers:h,rowIndex:i+1,row:d[i],indosCol:ic,courseCol:cc,statusCol:sc}; }
+  return null;
+}
+async function outStaffOk(username,passkey,indos,course){
+  if(!username||!passkey||!indos||!course) throw new Error('All fields are required');
+  username=norm(username).toLowerCase(); passkey=norm(passkey); indos=norm(indos).toUpperCase(); course=norm(course);
+  const staff=await outValidateStaff(username,passkey); if(!staff) throw new Error('Invalid Email or Passkey');
+  const loc=await outLocateIndos(indos); if(!loc) throw new Error('INDOS not found in EL DATA or New EL DATA');
+  const courses=norm(loc.row[loc.courseCol]).split(',').map(x=>x.trim()).filter(Boolean); if(!courses.includes(course)) throw new Error('Course not found for this INDOS');
+  // COMPLETED is kept only as backend history for payroll/time-chart. It is NOT shown as a website tab.
+  const hist=await values("'COMPLETED'!A:V");
+  for(let j=1;j<hist.length;j++) if(norm(hist[j][2]).toUpperCase()===indos && norm(hist[j][14])===course) throw new Error('Already completed entry exists');
+  const row=[...loc.row]; while(row.length<22) row.push(''); row[loc.courseCol]=course; if(loc.statusCol>=0) row[loc.statusCol]='Completed'; row[21]=nowString(); await append('COMPLETED',row);
+  const remaining=courses.filter(c=>c!==course);
+  if(!remaining.length) await deleteRow(loc.sheetName,loc.rowIndex); else { await update(`'${loc.sheetName}'!${toA1Column(loc.courseCol+1)}${loc.rowIndex}`,[[remaining.join(', ')]]); if(loc.statusCol>=0) await update(`'${loc.sheetName}'!${toA1Column(loc.statusCol+1)}${loc.rowIndex}`,[['Pending']]); }
+  const enrolled=norm(loc.row[10]).toUpperCase(); let phone=(OUT_ENROLL_CONTACTS[enrolled]||'').replace(/\D/g,'').slice(-10); let whatsapp=''; if(phone){const msg=`INDoS No: ${indos}\nCourse Name: ${course}\n\nThe course is successfully completed.`; whatsapp=`https://wa.me/91${phone}?text=${encodeURIComponent(msg)}`;}
+  return {message:'Course completed successfully ✔',whatsapp};
+}
+async function outGetAllocatedCourses(username,passkey){
+  const staff=await outValidateStaff(username,passkey); if(!staff) throw new Error('Invalid login'); const out=[];
+  for(const sh of ['EL DATA','New EL DATA']){ const d=await values(`'${sh}'!A:Z`); if(d.length<2) continue; const h=d[0].map(outHeaderKey), ic=h.indexOf('indosno'), cc=h.indexOf('courses'), fc=h.indexOf('followedby'); if(ic<0||cc<0||fc<0) continue; for(let i=1;i<d.length;i++){ if(norm(d[i][fc]).toLowerCase()!==staff.toLowerCase()) continue; const ind=norm(d[i][ic]); norm(d[i][cc]).split(',').map(x=>x.trim()).filter(Boolean).forEach(c=>out.push({indos:ind,course:c})); } }
+  return out;
+}
+function outSendWhatsApp(phone,message){ phone=String(phone||'').replace(/\D/g,'').slice(-10); return `https://wa.me/91${phone}?text=${encodeURIComponent(message||'')}`; }
+const outsourceHandlers={getTimeChartData:outGetTimeChartData,getCoursesByIndos:outGetCoursesByIndos,staffOk:outStaffOk,getAllocatedCourses:outGetAllocatedCourses,sendWhatsApp:outSendWhatsApp};
+
+app.post('/api/outsource/call',async(req,res)=>{try{const {fn,args=[]}=req.body||{};if(!outsourceHandlers[fn])return res.status(404).json({ok:false,error:`Unknown function: ${fn}`});const result=await outsourceHandlers[fn](...(Array.isArray(args)?args:[]));res.json({ok:true,result});}catch(e){console.error(e);res.status(500).json({ok:false,error:e.message||String(e)});}});
+
+app.get('/health',(req,res)=>res.status(200).json({ok:true,service:'MM-Merged',time:new Date().toISOString()}));
+
+// Home -> MM-EL
+app.get('/',(req,res)=>res.redirect('/el/'));
+
+// Keep clean URLs with a trailing slash.
+app.get('/el',(req,res)=>res.redirect('/el/'));
+app.get('/outsource',(req,res)=>res.redirect('/outsource/'));
+
+// Serve both frontends.
+app.use('/el',express.static(path.join(__dirname,'public','el')));
+app.use('/outsource',express.static(path.join(__dirname,'public','outsource')));
+
+// Express 4/5-safe SPA fallbacks. Do NOT use app.get('*') or '/el/*'.
+app.get(/^\/el\/.*$/, (req,res)=>
+  res.sendFile(path.join(__dirname,'public','el','index.html'))
+);
+app.get(/^\/outsource\/.*$/, (req,res)=>
+  res.sendFile(path.join(__dirname,'public','outsource','index.html'))
+);
+
+// Final 404 fallback.
+app.use((req,res)=>res.status(404).send('Page not found'));
+
+app.listen(PORT,'0.0.0.0',()=>console.log(`MM merged Railway server listening on ${PORT}`));
