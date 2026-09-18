@@ -212,8 +212,8 @@ app.get('/health',(req,res)=>res.status(200).json({ok:true,service:'MM-Merged',t
 app.get('/',(req,res)=>res.redirect('/el/'));
 
 // Keep clean URLs with a trailing slash.
-app.get('/el',(req,res)=>res.redirect('/el/'));
-app.get('/outsource',(req,res)=>res.redirect('/outsource/'));
+app.get(/^\/el$/,(req,res)=>res.redirect('/el/'));
+app.get(/^\/outsource$/,(req,res)=>res.redirect('/outsource/'));
 
 // Serve both frontends.
 app.use('/el',express.static(path.join(__dirname,'public','el')));
